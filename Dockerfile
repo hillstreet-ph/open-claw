@@ -330,6 +330,7 @@ COPY --from=selected-runtime-assets --chown=node:node /app/node-host-launcher.mj
 COPY --from=selected-runtime-assets --chown=node:node /app/node-compile-cache.mjs .
 COPY --from=selected-runtime-assets --chown=node:node /app/docker-entrypoint.mjs .
 COPY --from=selected-runtime-assets --chown=node:node /app/openclaw.mjs .
+COPY --from=selected-runtime-assets --chown=node:node /app/openclaw.json ./openclaw.json
 COPY --from=selected-runtime-assets --chown=node:node /app/.runtime-bootstrap/scripts ./scripts
 COPY --from=selected-runtime-assets --chown=node:node /app/${OPENCLAW_BUNDLED_PLUGIN_DIR} ./${OPENCLAW_BUNDLED_PLUGIN_DIR}
 COPY --from=selected-runtime-assets --chown=node:node /app/skills ./skills
