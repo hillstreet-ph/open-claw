@@ -1,5 +1,5 @@
 {
   "gateway": {
-    "mode": "remote"
+    "mode": "local"
   }
 }
