@@ -203,7 +203,12 @@ jobs:
     uses: ./.github/workflows/fork-docker-publish.yml
     with:
       extensions: ""
-    secrets: inherit
+    # Pass only what the reusable workflow declares — `secrets: inherit` hands
+    # every parent secret to the callee and is flagged by zizmor
+    # (secrets-inherit, medium) in the Workflow Sanity audit.
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
   deploy:
     needs: [version, publish]
