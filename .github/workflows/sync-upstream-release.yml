@@ -1,0 +1,61 @@
+name: Sync upstream and tag release
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync upstream main
+        run: |
+          git remote add upstream https://github.com/openclaw/openclaw.git || true
+          git fetch upstream main
+          git config user.name "open-claw-bot"
+          git config user.email "bot@hillstreet-ph"
+          git merge --ff-only upstream/main || echo "::warning::upstream diverged; fast-forward not possible"
+
+      - name: Version, summary and details
+        id: meta
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          PREV="$(git describe --tags --abbrev=0 2>/dev/null || echo '')"
+          RANGE="${PREV:+$PREV..}HEAD"
+          SUMMARY="$(git log --oneline $RANGE | head -20)"
+          DETAILS="$(git log --format='- %h %s (%an)' $RANGE | head -50)"
+          {
+            echo "version=$VERSION"
+            echo "summary<<EOF"
+            echo "$SUMMARY"
+            echo "EOF"
+            echo "details<<EOF"
+            echo "$DETAILS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Push branch
+        run: git push origin main || true
+
+      - name: Tag release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.meta.outputs.version }}
+          name: v${{ steps.meta.outputs.version }}
+          body: |
+            ## Summary
+            ${{ steps.meta.outputs.summary }}
+
+            ## Details
+            ${{ steps.meta.outputs.details }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
