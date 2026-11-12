@@ -12,6 +12,19 @@ on:
         required: false
         default: ""
         type: string
+  # Called by fork-release.yml so a release publishes the image in the same run.
+  workflow_call:
+    inputs:
+      extensions:
+        description: Optional OPENCLAW_EXTENSIONS build arg (space/comma-separated plugin ids)
+        required: false
+        default: ""
+        type: string
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: true
+      DOCKERHUB_TOKEN:
+        required: true
 
 permissions:
   contents: read
@@ -85,6 +98,8 @@ jobs:
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tags.outputs.sha_tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tags.outputs.release_tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tags.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           build-args: |
             GIT_COMMIT=${{ github.sha }}
             OPENCLAW_EXTENSIONS=${{ inputs.extensions }}

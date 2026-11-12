@@ -1,0 +1,232 @@
+# Fork release automation for hillstreet-ph/open-claw.
+#
+# On every push to main this workflow:
+#   1. bumps the patch version in package.json (skipped when the commit is the
+#      version bump itself, or carries [skip release]),
+#   2. creates an annotated tag `vX.Y.Z` whose message carries the summary and
+#      the details block,
+#   3. publishes a GitHub Release with the same summary + details,
+#   4. builds and pushes the Docker Hub image (reuses fork-docker-publish.yml),
+#   5. asks Zeabur to redeploy the open-claw service so the new image goes live.
+#
+# Required repository secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN, ZEABUR_TOKEN.
+# No secret value is ever written into this file.
+name: Fork Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump to apply
+        required: false
+        default: patch
+        type: choice
+        options: [patch, minor, major, none]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  ZEABUR_SERVICE_ID: 6aef4825dede4920ffc64943
+  ZEABUR_ENVIRONMENT_ID: 6aef3380617188b6dd50f0c3
+
+jobs:
+  version:
+    # Never re-run on our own version-bump commit.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (!contains(github.event.head_commit.message, '[skip release]') &&
+       !startsWith(github.event.head_commit.message, 'chore(release):'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
+      released: ${{ steps.bump.outputs.released }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure git identity
+        run: |
+          set -euo pipefail
+          git config user.name "open-claw release bot"
+          git config user.email "release-bot@users.noreply.github.com"
+
+      - name: Resolve next version
+        id: bump
+        env:
+          BUMP: ${{ inputs.bump || 'patch' }}
+        run: |
+          set -euo pipefail
+          current="$(node -p "require('./package.json').version")"
+          last_tag="$(git tag --list 'v*' --sort=-v:refname | head -1 || true)"
+
+          if [[ -z "${last_tag}" ]]; then
+            # First automated release: publish the version already in package.json.
+            next="${current}"
+          elif [[ "${BUMP}" == "none" ]]; then
+            next="${current}"
+          else
+            base="${last_tag#v}"
+            IFS='.' read -r major minor patch <<< "${base}"
+            case "${BUMP}" in
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              patch) patch=$((patch + 1)) ;;
+            esac
+            next="${major}.${minor}.${patch}"
+          fi
+
+          tag="v${next}"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            echo "Tag ${tag} already exists; nothing to release." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "version=${next}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "released=true" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${tag} (previous tag: ${last_tag:-none})" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build release notes
+        if: steps.bump.outputs.released == 'true'
+        id: notes
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+          TAG: ${{ steps.bump.outputs.tag }}
+        run: |
+          set -euo pipefail
+          last_tag="$(git tag --list 'v*' --sort=-v:refname | head -1 || true)"
+          range="${last_tag:+${last_tag}..HEAD}"
+          range="${range:-HEAD}"
+
+          # Summary: one line, the headline of this release.
+          summary="$(git log ${range} --no-merges --pretty=%s | head -1)"
+          summary="${summary:-Release ${TAG}}"
+
+          # Details: grouped commit list plus build metadata.
+          {
+            echo "### Changes"
+            echo
+            git log ${range} --no-merges --pretty='- %s (`%h`)' | head -60
+            echo
+            echo "### Build"
+            echo
+            echo "- Version: \`${VERSION}\`"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Image: \`docker.io/hillstreet/open-claw:${VERSION}\`"
+            echo "- Gateway: https://open-claw.zeabur.app"
+          } > /tmp/details.md
+
+          {
+            echo "summary<<__SUMMARY_EOF__"
+            echo "${summary}"
+            echo "__SUMMARY_EOF__"
+            echo "details<<__DETAILS_EOF__"
+            cat /tmp/details.md
+            echo "__DETAILS_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Bump package.json version
+        if: steps.bump.outputs.released == 'true'
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const p = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            p.version = process.env.VERSION;
+            fs.writeFileSync("package.json", JSON.stringify(p, null, 2) + "\n");
+          '
+          git diff --stat
+
+      - name: Commit, tag and push
+        if: steps.bump.outputs.released == 'true'
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+          TAG: ${{ steps.bump.outputs.tag }}
+          SUMMARY: ${{ steps.notes.outputs.summary }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git add package.json
+          git commit -m "chore(release): ${TAG} [skip release]" -m "${SUMMARY}"
+          # Annotated tag carries the summary and the details block.
+          {
+            echo "${SUMMARY}"
+            echo
+            cat /tmp/details.md
+          } > /tmp/tagmsg.txt
+          git tag -a "${TAG}" -F /tmp/tagmsg.txt
+          git push origin "HEAD:${GITHUB_REF_NAME}" --follow-tags
+
+      - name: Publish GitHub Release
+        if: steps.bump.outputs.released == 'true'
+        env:
+          TAG: ${{ steps.bump.outputs.tag }}
+          SUMMARY: ${{ steps.notes.outputs.summary }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          {
+            echo "${SUMMARY}"
+            echo
+            cat /tmp/details.md
+          } > /tmp/release-body.md
+          gh release create "${TAG}" \
+            --title "${TAG} — ${SUMMARY}" \
+            --notes-file /tmp/release-body.md \
+            --latest
+
+  publish:
+    needs: version
+    if: needs.version.outputs.released == 'true'
+    uses: ./.github/workflows/fork-docker-publish.yml
+    with:
+      extensions: ""
+    secrets: inherit
+
+  deploy:
+    needs: [version, publish]
+    if: needs.version.outputs.released == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Redeploy the Zeabur service
+        env:
+          ZEABUR_TOKEN: ${{ secrets.ZEABUR_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${ZEABUR_TOKEN}" ]]; then
+            echo "::error::ZEABUR_TOKEN secret is not set; cannot trigger the Zeabur redeploy."
+            exit 1
+          fi
+          response="$(curl -sS --max-time 60 -X POST https://api.zeabur.com/graphql \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${ZEABUR_TOKEN}" \
+            -d "{\"query\":\"mutation { redeployService(serviceID: \\\"${ZEABUR_SERVICE_ID}\\\", environmentID: \\\"${ZEABUR_ENVIRONMENT_ID}\\\") }\"}")"
+          echo "${response}"
+          if echo "${response}" | grep -q '"errors"'; then
+            echo "::error::Zeabur redeploy failed."
+            exit 1
+          fi
+          {
+            echo "## Deployed ${TAG}"
+            echo "- Zeabur service: \`${ZEABUR_SERVICE_ID}\`"
+            echo "- Environment: \`${ZEABUR_ENVIRONMENT_ID}\`"
+            echo "- Gateway: https://open-claw.zeabur.app"
+          } >> "$GITHUB_STEP_SUMMARY"
