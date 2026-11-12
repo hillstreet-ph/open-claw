@@ -70,7 +70,10 @@ jobs:
         run: |
           set -euo pipefail
           current="$(node -p "require('./package.json').version")"
-          last_tag="$(git tag --list 'v*' --sort=-v:refname | head -1 || true)"
+          # NOTE: never pipe git into `head` under `set -o pipefail` — git dies of
+          # SIGPIPE (exit 141) once head closes the pipe. Use --count instead.
+          last_tag="$(git for-each-ref --sort=-v:refname --count=1 \
+            --format='%(refname:short)' 'refs/tags/v*' || true)"
 
           if [[ -z "${last_tag}" ]]; then
             # First automated release: publish the version already in package.json.
@@ -108,19 +111,22 @@ jobs:
           TAG: ${{ steps.bump.outputs.tag }}
         run: |
           set -euo pipefail
-          last_tag="$(git tag --list 'v*' --sort=-v:refname | head -1 || true)"
+          last_tag="$(git for-each-ref --sort=-v:refname --count=1 \
+            --format='%(refname:short)' 'refs/tags/v*' || true)"
           range="${last_tag:+${last_tag}..HEAD}"
           range="${range:-HEAD}"
 
           # Summary: one line, the headline of this release.
-          summary="$(git log ${range} --no-merges --pretty=%s | head -1)"
+          # `-1` instead of `| head -1`: piping git into head raises SIGPIPE (141)
+          # under pipefail and fails the step.
+          summary="$(git log ${range} --no-merges --pretty=%s -1)"
           summary="${summary:-Release ${TAG}}"
 
           # Details: grouped commit list plus build metadata.
           {
             echo "### Changes"
             echo
-            git log ${range} --no-merges --pretty='- %s (`%h`)' | head -60
+            git log ${range} --no-merges --pretty='- %s (`%h`)' -60
             echo
             echo "### Build"
             echo
