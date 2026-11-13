@@ -65,7 +65,11 @@ jobs:
       # The commit that actually carries the release. The publish job must build
       # THIS, not github.sha: the bump commit is created inside this job, so
       # github.sha is always one version behind the tag.
-      sha: ${{ steps.bump.outputs.sha }}
+      # Written by the `Commit, tag and push` step (id: publish_commit), which is
+      # the only place that knows the commit that actually landed. Referencing
+      # steps.bump here silently fell back to the pre-bump GITHUB_SHA placeholder,
+      # so publish built the previous tree and tagged it with the new version.
+      sha: ${{ steps.publish_commit.outputs.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -126,8 +130,6 @@ jobs:
           echo "version=${next}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "released=true" >> "$GITHUB_OUTPUT"
-          # Placeholder; the push step rewrites this with the commit that lands.
-          echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
           echo "Releasing ${tag} (previous tag: ${last_tag:-none})" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build release notes
@@ -187,6 +189,7 @@ jobs:
           git diff --stat
 
       - name: Commit, tag and push
+        id: publish_commit
         if: steps.bump.outputs.released == 'true'
         env:
           VERSION: ${{ steps.bump.outputs.version }}
