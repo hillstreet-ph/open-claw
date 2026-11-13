@@ -22,6 +22,10 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  # Called by fork-release.yml as its release gate. Without this trigger the
+  # `uses:` reference fails at planning time and the release run dies with no
+  # jobs at all.
+  workflow_call:
 
 permissions:
   contents: read
