@@ -1,6 +1,6 @@
 {
   "name": "openclaw",
-  "version": "2026.11.5",
+  "version": "2026.11.-20261113043202",
   "openclaw": {
     "updateAdmissionProtocol": 1,
     "updatePreflightProtocol": 1,
