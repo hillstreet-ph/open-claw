@@ -1,0 +1,39 @@
+name: Auto release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.repository == 'hillstreet-ph/open-claw'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: ver
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          TAG="v${VERSION}-$(date -u +%Y%m%d%H%M%S)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.ver.outputs.tag }}" \
+            --target main \
+            --title "open-claw ${{ steps.ver.outputs.version }}" \
+            --generate-notes || true
