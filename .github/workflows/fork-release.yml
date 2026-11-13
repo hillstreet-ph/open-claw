@@ -7,7 +7,8 @@
 #      the details block,
 #   3. publishes a GitHub Release with the same summary + details,
 #   4. builds and pushes the Docker Hub image (reuses fork-docker-publish.yml),
-#   5. asks Zeabur to redeploy the open-claw service so the new image goes live.
+#   5. points the Zeabur service at the new Docker Hub tag (Docker Hub is the only deploy source)
+#      and checks the running gateway reports that version.
 #
 # Required repository secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN, ZEABUR_TOKEN.
 # No secret value is ever written into this file.
@@ -36,6 +37,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   ZEABUR_SERVICE_ID: 6aef4825dede4920ffc64943
   ZEABUR_ENVIRONMENT_ID: 6aef3380617188b6dd50f0c3
+  IMAGE_NAME: hillstreet/open-claw
 
 jobs:
   # Gate: never release a tree that fails validation. fork-validate.yml is the
@@ -284,37 +286,29 @@ jobs:
     needs: [version, publish]
     if: needs.version.outputs.released == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
-      - name: Redeploy the Zeabur service
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          sparse-checkout: .github/scripts
+      - name: Deploy the released Docker Hub image to Zeabur
         env:
           ZEABUR_TOKEN: ${{ secrets.ZEABUR_TOKEN }}
           TAG: ${{ needs.version.outputs.tag }}
         run: |
           set -euo pipefail
           if [[ -z "${ZEABUR_TOKEN}" ]]; then
-            echo "::error::ZEABUR_TOKEN secret is not set; cannot trigger the Zeabur redeploy."
+            echo "::error::ZEABUR_TOKEN secret is not set; cannot deploy to Zeabur."
             exit 1
           fi
-          # Build the GraphQL body with printf, not nested shell escaping — a
-          # single mis-escaped quote silently sends invalid JSON. Kept on one
-          # line so the YAML block scalar stays valid.
-          printf '{"query":"mutation { redeployService(serviceID: \\"%s\\", environmentID: \\"%s\\") }"}' \
-            "${ZEABUR_SERVICE_ID}" "${ZEABUR_ENVIRONMENT_ID}" > /tmp/zeabur.json
-          python3 -c "import json;json.load(open('/tmp/zeabur.json'))"  # fail fast if malformed
-          response="$(curl -sS --max-time 60 -X POST https://api.zeabur.com/graphql \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer ${ZEABUR_TOKEN}" \
-            --data-binary "@/tmp/zeabur.json")"
-          echo "${response}"
-          if echo "${response}" | grep -q '"errors"'; then
-            echo "::error::Zeabur redeploy failed."
-            exit 1
-          fi
+          # Docker Hub is the only deploy source: pin the service to the immutable release tag
+          # (a bare redeploy re-pulled whatever the service pointed at, and a Zeabur git trigger
+          # rebuilt main from source instead of running the published image).
+          python3 .github/scripts/zeabur_deploy_image.py "docker.io/${IMAGE_NAME}" "${TAG#v}"
           {
             echo "## Deployed ${TAG}"
+            echo "- Image: \`docker.io/${IMAGE_NAME}:${TAG#v}\`"
             echo "- Zeabur service: \`${ZEABUR_SERVICE_ID}\`"
-            echo "- Environment: \`${ZEABUR_ENVIRONMENT_ID}\`"
             echo "- Gateway: https://open-claw.zeabur.app"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -340,22 +334,16 @@ jobs:
           echo "::error::Gateway did not report healthy within 5 minutes of deploy."
           exit 1
 
-      - name: Self-heal — retry the redeploy once on failure
+      - name: Self-heal — retry the deploy once on failure
         if: failure()
         env:
           ZEABUR_TOKEN: ${{ secrets.ZEABUR_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
           set -euo pipefail
-          # One automatic retry: a Zeabur redeploy can fail transiently while a
-          # previous rollout is still settling. If the retry also fails the job
-          # stays red and a human looks at it — we never loop.
-          echo "::warning::Deploy verification failed; retrying the Zeabur redeploy once."
-          printf '{"query":"mutation { redeployService(serviceID: \\"%s\\", environmentID: \\"%s\\") }"}' \
-            "${ZEABUR_SERVICE_ID}" "${ZEABUR_ENVIRONMENT_ID}" > /tmp/zeabur-retry.json
-          python3 -c "import json;json.load(open('/tmp/zeabur-retry.json'))"
-          curl -sS --max-time 60 -X POST https://api.zeabur.com/graphql \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer ${ZEABUR_TOKEN}" \
-            --data-binary "@/tmp/zeabur-retry.json" || true
+          # One automatic retry: a Zeabur rollout can fail transiently while a previous one is still
+          # settling. If the retry also fails the job stays red and a human looks at it.
+          echo "::warning::Deploy verification failed; retrying the Zeabur deploy once."
+          python3 .github/scripts/zeabur_deploy_image.py "docker.io/${IMAGE_NAME}" "${TAG#v}" --redeploy || true
           sleep 45
           curl -sS --max-time 10 https://open-claw.zeabur.app/health || true
