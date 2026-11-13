@@ -190,8 +190,28 @@ jobs:
             echo
             cat /tmp/details.md
           } > /tmp/tagmsg.txt
-          git tag -a "${TAG}" -F /tmp/tagmsg.txt
-          git push origin "HEAD:${GITHUB_REF_NAME}" --follow-tags
+          # main can move between checkout and push (a PR merge, another
+          # workflow). A bare push is then rejected with "fetch first" and the
+          # whole release fails. Rebase the bump commit onto the current tip and
+          # retry a few times before giving up. The tag is (re)created AFTER the
+          # rebase so it always points at the commit that actually lands.
+          for attempt in 1 2 3 4 5; do
+            git fetch --quiet origin "${GITHUB_REF_NAME}"
+            if git rebase --quiet "origin/${GITHUB_REF_NAME}"; then
+              git tag -d "${TAG}" >/dev/null 2>&1 || true
+              git tag -a "${TAG}" -F /tmp/tagmsg.txt
+              if git push origin "HEAD:${GITHUB_REF_NAME}" --follow-tags; then
+                echo "Pushed ${TAG} on attempt ${attempt}."
+                exit 0
+              fi
+            else
+              git rebase --abort || true
+            fi
+            echo "Push attempt ${attempt} lost the race; retrying in $((attempt * 3))s."
+            sleep $((attempt * 3))
+          done
+          echo "::error::Could not push ${TAG} after 5 attempts; main kept moving."
+          exit 1
 
       - name: Publish GitHub Release
         if: steps.bump.outputs.released == 'true'
