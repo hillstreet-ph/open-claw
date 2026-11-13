@@ -168,8 +168,22 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # checkout runs with persist-credentials:false, so no credential is in
+          # .git/config — install the token as an extraheader or `git push` (and
+          # `--follow-tags`) has nothing to authenticate with.
+          auth_header="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
+          echo "::add-mask::${auth_header}"
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic ${auth_header}"
           git add package.json
-          git commit -m "chore(release): ${TAG} [skip release]" -m "${SUMMARY}"
+          # package.json can already carry the target version (first automated
+          # release reuses the version in the file, and a `none` bump is a
+          # no-op). `git commit` exits 1 on an empty index, which would fail the
+          # step, so commit only when the bump actually changed something.
+          if git diff --cached --quiet; then
+            echo "package.json already at ${VERSION}; tagging without a bump commit."
+          else
+            git commit -m "chore(release): ${TAG} [skip release]" -m "${SUMMARY}"
+          fi
           # Annotated tag carries the summary and the details block.
           {
             echo "${SUMMARY}"
@@ -226,10 +240,16 @@ jobs:
             echo "::error::ZEABUR_TOKEN secret is not set; cannot trigger the Zeabur redeploy."
             exit 1
           fi
+          # Build the GraphQL body with printf, not nested shell escaping — a
+          # single mis-escaped quote silently sends invalid JSON. Kept on one
+          # line so the YAML block scalar stays valid.
+          printf '{"query":"mutation { redeployService(serviceID: \\"%s\\", environmentID: \\"%s\\") }"}' \
+            "${ZEABUR_SERVICE_ID}" "${ZEABUR_ENVIRONMENT_ID}" > /tmp/zeabur.json
+          python3 -c "import json;json.load(open('/tmp/zeabur.json'))"  # fail fast if malformed
           response="$(curl -sS --max-time 60 -X POST https://api.zeabur.com/graphql \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${ZEABUR_TOKEN}" \
-            -d "{\"query\":\"mutation { redeployService(serviceID: \\\"${ZEABUR_SERVICE_ID}\\\", environmentID: \\\"${ZEABUR_ENVIRONMENT_ID}\\\") }\"}")"
+            --data-binary "@/tmp/zeabur.json")"
           echo "${response}"
           if echo "${response}" | grep -q '"errors"'; then
             echo "::error::Zeabur redeploy failed."
