@@ -97,8 +97,17 @@ jobs:
           elif [[ "${BUMP}" == "none" ]]; then
             next="${current}"
           else
+            # Strip any pre-release/build suffix (e.g. the -20261113044514 that
+            # an older timestamping pipeline appended) before splitting, and
+            # drop a non-numeric patch part. Without this, "2026.11.5-2026111…"
+            # lands in $patch and shifts the number backwards, producing tags
+            # like v2026.11.-20261113044508.
             base="${last_tag#v}"
+            base="${base%%-*}"
             IFS='.' read -r major minor patch <<< "${base}"
+            [[ "${major}" =~ ^[0-9]+$ ]] || major=0
+            [[ "${minor}" =~ ^[0-9]+$ ]] || minor=0
+            [[ "${patch}" =~ ^[0-9]+$ ]] || patch=0
             case "${BUMP}" in
               major) major=$((major + 1)); minor=0; patch=0 ;;
               minor) minor=$((minor + 1)); patch=0 ;;
