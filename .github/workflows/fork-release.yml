@@ -38,7 +38,19 @@ env:
   ZEABUR_ENVIRONMENT_ID: 6aef3380617188b6dd50f0c3
 
 jobs:
+  # Gate: never release a tree that fails validation. fork-validate.yml is the
+  # single source of truth for "is this shippable" (workflow YAML parses,
+  # openclaw.json has one publicOrigin and no wildcard origins, package.json is
+  # valid semver). Reusing it here means the release cannot drift from the gate.
+  validate:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (!contains(github.event.head_commit.message, '[skip release]') &&
+       !startsWith(github.event.head_commit.message, 'chore(release):'))
+    uses: ./.github/workflows/fork-validate.yml
+
   version:
+    needs: validate
     # Never re-run on our own version-bump commit.
     if: >-
       github.event_name == 'workflow_dispatch' ||
@@ -293,3 +305,45 @@ jobs:
             echo "- Environment: \`${ZEABUR_ENVIRONMENT_ID}\`"
             echo "- Gateway: https://open-claw.zeabur.app"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify the gateway is healthy after deploy
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Zeabur rolls the pod asynchronously, so poll rather than sampling
+          # once. A deploy that returns true but never becomes healthy is the
+          # failure this step exists to catch.
+          url="https://open-claw.zeabur.app/health"
+          for attempt in $(seq 1 30); do
+            body="$(curl -sS --max-time 10 "${url}" || true)"
+            if echo "${body}" | grep -q '"ok":true'; then
+              echo "Healthy after ${attempt} attempt(s): ${body}"
+              echo "- Health: \`${body}\`" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "attempt ${attempt}/30: ${body:-<no response>}"
+            sleep 10
+          done
+          echo "::error::Gateway did not report healthy within 5 minutes of deploy."
+          exit 1
+
+      - name: Self-heal — retry the redeploy once on failure
+        if: failure()
+        env:
+          ZEABUR_TOKEN: ${{ secrets.ZEABUR_TOKEN }}
+        run: |
+          set -euo pipefail
+          # One automatic retry: a Zeabur redeploy can fail transiently while a
+          # previous rollout is still settling. If the retry also fails the job
+          # stays red and a human looks at it — we never loop.
+          echo "::warning::Deploy verification failed; retrying the Zeabur redeploy once."
+          printf '{"query":"mutation { redeployService(serviceID: \\"%s\\", environmentID: \\"%s\\") }"}' \
+            "${ZEABUR_SERVICE_ID}" "${ZEABUR_ENVIRONMENT_ID}" > /tmp/zeabur-retry.json
+          python3 -c "import json;json.load(open('/tmp/zeabur-retry.json'))"
+          curl -sS --max-time 60 -X POST https://api.zeabur.com/graphql \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${ZEABUR_TOKEN}" \
+            --data-binary "@/tmp/zeabur-retry.json" || true
+          sleep 45
+          curl -sS --max-time 10 https://open-claw.zeabur.app/health || true

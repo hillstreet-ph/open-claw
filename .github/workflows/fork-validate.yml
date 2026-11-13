@@ -1,0 +1,130 @@
+# Fork validation gate for hillstreet-ph/open-claw.
+#
+# Runs on every push to main and on every PR, and is the gate the release
+# pipeline waits for. It answers one question: is this tree shippable?
+#
+#   1. workflow sanity — every workflow file parses as YAML and has a name,
+#      an `on:` trigger and at least one job. A malformed workflow silently
+#      never runs, which is the failure mode that hides for weeks.
+#   2. config sanity — openclaw.json parses, has exactly one publicOrigin, and
+#      its controlUi.allowedOrigins are full origins (no wildcards). This is
+#      the check that would have caught the duplicate publicOrigin key and the
+#      "Browser origin not allowed" class of bug before it reached the gateway.
+#   3. package sanity — package.json parses and its version is a valid semver.
+#
+# Deliberately fast: no install, no build. The heavy build is the Docker job in
+# fork-release.yml; this gate exists to fail in 30 seconds, not 30 minutes.
+name: Fork Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-validate-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate workflow files
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, sys
+          try:
+              import yaml
+          except ImportError:
+              sys.exit("PyYAML missing; cannot validate workflows")
+          bad = []
+          files = sorted(glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml"))
+          for f in files:
+              try:
+                  doc = yaml.safe_load(open(f, encoding="utf-8"))
+              except Exception as e:
+                  bad.append(f"{f}: does not parse: {e}")
+                  continue
+              if not isinstance(doc, dict):
+                  bad.append(f"{f}: not a mapping")
+                  continue
+              if not doc.get("name"):
+                  bad.append(f"{f}: missing `name`")
+              # YAML 1.1 parses a bare `on:` key as boolean True.
+              if "on" not in doc and True not in doc:
+                  bad.append(f"{f}: missing `on` trigger")
+              if not doc.get("jobs"):
+                  bad.append(f"{f}: no jobs")
+          print(f"checked {len(files)} workflow files")
+          if bad:
+              print("\n".join("  - " + b for b in bad))
+              sys.exit(1)
+          PY
+
+      - name: Validate openclaw.json
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, sys
+          path = "openclaw.json"
+          try:
+              cfg = json.load(open(path, encoding="utf-8"))
+          except FileNotFoundError:
+              print(f"{path} not present in this tree; skipping")
+              sys.exit(0)
+          except Exception as e:
+              sys.exit(f"{path} does not parse: {e}")
+
+          gw = cfg.get("gateway") or {}
+          problems = []
+
+          # A duplicate key is silently collapsed by json.load, so re-scan the
+          # raw text for repeated top-level gateway keys.
+          raw = open(path, encoding="utf-8").read()
+          if raw.count('"publicOrigin"') > 1:
+              problems.append(f'"publicOrigin" appears {raw.count(chr(34)+"publicOrigin"+chr(34))} times; keep exactly one')
+
+          origin = gw.get("publicOrigin")
+          if origin and not origin.startswith(("http://", "https://")):
+              problems.append(f"gateway.publicOrigin is not a full origin: {origin!r}")
+
+          allowed = ((gw.get("controlUi") or {}).get("allowedOrigins")) or []
+          for a in allowed:
+              if "*" in a:
+                  problems.append(f"gateway.controlUi.allowedOrigins contains a wildcard: {a!r}")
+              elif not a.startswith(("http://", "https://")):
+                  problems.append(f"gateway.controlUi.allowedOrigins entry is not a full origin: {a!r}")
+
+          if problems:
+              print("\n".join("  - " + p for p in problems))
+              sys.exit(1)
+          print(f"openclaw.json ok (publicOrigin={origin}, allowedOrigins={allowed})")
+          PY
+
+      - name: Validate package.json
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const p = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            if (!/^\d+\.\d+\.\d+/.test(p.version || "")) {
+              console.error("package.json version is not semver: " + p.version);
+              process.exit(1);
+            }
+            console.log("package.json ok (version " + p.version + ")");
+          '

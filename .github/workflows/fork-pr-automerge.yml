@@ -1,0 +1,173 @@
+# Fork PR validation + auto-merge for hillstreet-ph/open-claw.
+#
+# Closes the loop the release pipeline leaves open: a PR that is green and
+# conflict-free should not need a human to click Merge. On every PR event (and
+# on a 30-minute sweep, so a PR that goes green later is still picked up) this
+# workflow:
+#
+#   1. validates each open PR — draft state, mergeability, conflicts, and the
+#      conclusion of every check run on its head SHA,
+#   2. self-heals once — if the only thing standing in the way is a failed
+#      check run that is not a real code failure (a cancelled or timed-out run),
+#      it re-runs that workflow instead of merging or giving up,
+#   3. merges the PRs that pass, using a squash merge so main stays linear and
+#      the release pipeline sees one commit per PR,
+#   4. reports every PR it held back and exactly why, in the job summary.
+#
+# It never force-merges, never merges a draft, never merges a PR with conflicts,
+# and never merges a PR whose checks are still running.
+#
+# Required repository secret: none beyond the default GITHUB_TOKEN.
+name: Fork PR Automerge
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  schedule:
+    # Sweep for PRs that went green after their last event.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  actions: write
+
+concurrency:
+  group: fork-pr-automerge
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  validate-and-merge:
+    if: github.repository == 'hillstreet-ph/open-claw'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Validate and merge eligible pull requests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Checks that are advisory in this fork: they need repository secrets
+          # that GitHub withholds from Dependabot-triggered runs, or external
+          # services that are not part of the merge gate. A failure here must
+          # not block a merge, or every Dependabot PR would be stuck forever.
+          ADVISORY_RE='^(label|auto-response|ios-screenshot-capture|Labeler|Auto response|Stale|stale)$'
+
+          merged=0
+          held=0
+          healed=0
+
+          echo "## Fork PR automerge" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+
+          prs="$(gh api "repos/${REPO}/pulls?state=open&per_page=100" --jq '.[].number')"
+          if [ -z "${prs}" ]; then
+            echo "No open pull requests." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          for pr in ${prs}; do
+            info="$(gh api "repos/${REPO}/pulls/${pr}")"
+            title="$(echo "${info}" | jq -r '.title')"
+            draft="$(echo "${info}" | jq -r '.draft')"
+            mergeable="$(echo "${info}" | jq -r '.mergeable')"
+            mstate="$(echo "${info}" | jq -r '.mergeable_state')"
+            sha="$(echo "${info}" | jq -r '.head.sha')"
+            base="$(echo "${info}" | jq -r '.base.ref')"
+
+            # Only ever merge into main; anything else is a human decision.
+            if [ "${base}" != "main" ]; then
+              echo "- **#${pr}** ${title} — held: targets \`${base}\`, not \`main\`." >> "$GITHUB_STEP_SUMMARY"
+              held=$((held + 1)); continue
+            fi
+
+            if [ "${draft}" = "true" ]; then
+              echo "- **#${pr}** ${title} — held: draft." >> "$GITHUB_STEP_SUMMARY"
+              held=$((held + 1)); continue
+            fi
+
+            # GitHub computes mergeability lazily; null means "ask again".
+            if [ "${mergeable}" = "null" ] || [ -z "${mergeable}" ]; then
+              sleep 3
+              info="$(gh api "repos/${REPO}/pulls/${pr}")"
+              mergeable="$(echo "${info}" | jq -r '.mergeable')"
+              mstate="$(echo "${info}" | jq -r '.mergeable_state')"
+            fi
+
+            if [ "${mergeable}" != "true" ]; then
+              echo "- **#${pr}** ${title} — held: not mergeable (\`${mstate}\`). Resolve conflicts first." >> "$GITHUB_STEP_SUMMARY"
+              held=$((held + 1)); continue
+            fi
+
+            # Collect check runs on the head SHA.
+            checks="$(gh api "repos/${REPO}/commits/${sha}/check-runs?per_page=100")"
+            failing="$(echo "${checks}" | jq -r --arg re "${ADVISORY_RE}" '
+              [.check_runs[]
+               | select((.name | test($re)) | not)
+               | select(.status == "completed")
+               | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled")
+               | "\(.name)|\(.conclusion)|\(.id)|\(.html_url)"] | .[]')"
+            pending="$(echo "${checks}" | jq -r --arg re "${ADVISORY_RE}" '
+              [.check_runs[]
+               | select((.name | test($re)) | not)
+               | select(.status != "completed")
+               | .name] | .[]')"
+
+            if [ -n "${pending}" ]; then
+              echo "- **#${pr}** ${title} — held: checks still running ($(echo "${pending}" | tr '\n' ' '))." >> "$GITHUB_STEP_SUMMARY"
+              held=$((held + 1)); continue
+            fi
+
+            if [ -n "${failing}" ]; then
+              # Self-heal: a cancelled or timed-out run is infrastructure, not a
+              # code failure. Re-run it once and leave the PR for the next sweep
+              # rather than merging on a red board or failing the whole job.
+              rerun=0
+              while IFS='|' read -r name conclusion _id _url; do
+                [ -z "${name}" ] && continue
+                if [ "${conclusion}" = "cancelled" ] || [ "${conclusion}" = "timed_out" ]; then
+                  run_id="$(gh api "repos/${REPO}/actions/runs?head_sha=${sha}&per_page=100" \
+                    --jq "[.workflow_runs[] | select(.name == \"${name}\")][0].id // empty")"
+                  if [ -n "${run_id}" ]; then
+                    gh api -X POST "repos/${REPO}/actions/runs/${run_id}/rerun" >/dev/null 2>&1 \
+                      && { echo "  re-ran \`${name}\` (run ${run_id})"; rerun=$((rerun + 1)); } || true
+                  fi
+                fi
+              done <<< "${failing}"
+
+              if [ "${rerun}" -gt 0 ]; then
+                echo "- **#${pr}** ${title} — self-healed: re-ran ${rerun} cancelled/timed-out check(s); will retry next sweep." >> "$GITHUB_STEP_SUMMARY"
+                healed=$((healed + 1)); continue
+              fi
+
+              echo "- **#${pr}** ${title} — held: failing checks:" >> "$GITHUB_STEP_SUMMARY"
+              while IFS='|' read -r name conclusion _id url; do
+                [ -z "${name}" ] && continue
+                echo "  - \`${name}\` → ${conclusion} (${url})" >> "$GITHUB_STEP_SUMMARY"
+              done <<< "${failing}"
+              held=$((held + 1)); continue
+            fi
+
+            # Green and mergeable: squash-merge so main stays linear.
+            if gh api -X PUT "repos/${REPO}/pulls/${pr}/merge" \
+                 -f merge_method=squash \
+                 -f sha="${sha}" >/dev/null 2>&1; then
+              echo "- **#${pr}** ${title} — **merged** (squash, \`${sha:0:11}\`)." >> "$GITHUB_STEP_SUMMARY"
+              merged=$((merged + 1))
+            else
+              echo "- **#${pr}** ${title} — held: merge call rejected (branch moved or protection rule)." >> "$GITHUB_STEP_SUMMARY"
+              held=$((held + 1))
+            fi
+          done
+
+          {
+            echo
+            echo "**Merged:** ${merged} · **Held:** ${held} · **Self-healed:** ${healed}"
+          } >> "$GITHUB_STEP_SUMMARY"
