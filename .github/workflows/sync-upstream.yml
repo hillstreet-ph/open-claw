@@ -1,52 +1,40 @@
-name: Sync upstream and release
+name: Sync upstream
 
 on:
   schedule:
-    - cron: '0 3 * * *'
+    - cron: "0 3 * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   sync:
+    if: github.repository == 'hillstreet-ph/open-claw'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Sync with upstream openclaw/openclaw
+      - name: Sync from upstream
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git config user.name "openclaw-sync-bot"
-          git config user.email "bot@hillstreet.ph"
+          git config user.name "open-claw-bot"
+          git config user.email "bot@hillstreet-ph"
           git remote add upstream https://github.com/openclaw/openclaw.git
           git fetch upstream main
-          if git merge -X ours --no-edit upstream/main; then
+          git checkout main
+          if git merge --no-edit upstream/main; then
             git push origin main
           else
-            git merge --abort
-            echo "Merge conflict; sync skipped this run."
+            BRANCH="chore/upstream-sync-$(date -u +%Y%m%d)"
+            git checkout -b "$BRANCH" || true
+            git push origin "$BRANCH" || true
+            gh pr create --base main --head "$BRANCH" \
+              --title "Upstream sync $(date -u +%Y-%m-%d)" \
+              --body "Automated merge from openclaw/openclaw main. Resolve conflicts and merge; Zeabur deploys automatically on merge." || true
           fi
-
-      - name: Tag and release
-        run: |
-          VER=$(node -p "require('./package.json').version")
-          TAG="v$VER-$(date -u +%Y%m%d)"
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "Tag $TAG already exists; skipping release."
-            exit 0
-          fi
-          git tag "$TAG"
-          git push origin "$TAG"
-          {
-            echo "## Automated upstream sync release"
-            echo ""
-            echo "- Version: $VER"
-            echo "- Upstream: openclaw/openclaw@main"
-            echo "- Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "- Deploy: Zeabur auto-deploys main on push."
-          } > notes.md
-          gh release create "$TAG" --title "$TAG" --notes-file notes.md || true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
