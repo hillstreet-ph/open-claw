@@ -9,32 +9,83 @@ permissions:
   contents: write
   pull-requests: write
 
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
 jobs:
   sync:
     if: github.repository == 'hillstreet-ph/open-claw'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Sync from upstream
         id: sync
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+
           git config user.name "open-claw-bot"
           git config user.email "bot@hillstreet-ph"
+
+          # Authenticate pushes explicitly: checkout ran with
+          # persist-credentials: false, so no credential is configured.
+          git remote set-url origin \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
           git remote add upstream https://github.com/openclaw/openclaw.git
-          git fetch upstream main
+          git fetch upstream main --no-tags
           git checkout main
+          git reset --hard origin/main
+
           if git merge --no-edit upstream/main; then
+            if git diff --quiet origin/main..HEAD; then
+              echo "Already up to date with upstream; nothing to push."
+              echo "result=up-to-date" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             git push origin main
+            echo "result=merged" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Merge conflicted. Abort so the working tree is clean, then branch
+          # from the *upstream* side so the PR actually carries a diff.
+          # Previously this branched from unchanged HEAD, which produced an
+          # empty PR and a confusing `gh pr create` failure.
+          git merge --abort || true
+
+          BRANCH="chore/upstream-sync-$(date -u +%Y%m%d)"
+          git checkout -B "$BRANCH" origin/main
+
+          if ! git merge --no-edit upstream/main; then
+            echo "::warning::Upstream merge has conflicts; leaving the branch for manual resolution."
+            git add -A
+            git commit -m "chore: upstream sync $(date -u +%Y-%m-%d) (conflicts unresolved)" || true
+          fi
+
+          if git diff --quiet origin/main..HEAD; then
+            echo "No changes after merge attempt; skipping PR."
+            echo "result=no-diff" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git push --force-with-lease origin "$BRANCH"
+
+          # Reuse an existing open PR for this branch instead of failing.
+          EXISTING="$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$EXISTING" ]; then
+            echo "PR #${EXISTING} already open for ${BRANCH}; updated in place."
+            echo "result=pr-updated" >> "$GITHUB_OUTPUT"
           else
-            BRANCH="chore/upstream-sync-$(date -u +%Y%m%d)"
-            git checkout -b "$BRANCH" || true
-            git push origin "$BRANCH" || true
             gh pr create --base main --head "$BRANCH" \
               --title "Upstream sync $(date -u +%Y-%m-%d)" \
-              --body "Automated merge from openclaw/openclaw main. Resolve conflicts and merge; Zeabur deploys automatically on merge." || true
+              --body "Automated merge from openclaw/openclaw main. Resolve conflicts and merge; Zeabur deploys automatically on merge."
+            echo "result=pr-created" >> "$GITHUB_OUTPUT"
           fi
