@@ -20,6 +20,16 @@ on:
         required: false
         default: ""
         type: string
+      ref:
+        description: Commit to build. Defaults to the triggering SHA.
+        required: false
+        default: ""
+        type: string
+      version:
+        description: Version to tag the image with. Defaults to package.json.
+        required: false
+        default: ""
+        type: string
     secrets:
       DOCKERHUB_USERNAME:
         required: true
@@ -43,6 +53,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # When called from fork-release.yml this is the commit that carries the
+          # version bump; github.sha would be the pre-bump tree.
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Free runner disk for the monorepo build
         run: |
@@ -54,9 +67,12 @@ jobs:
 
       - name: Resolve immutable image tags
         id: tags
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          version="$(node -p "require('./package.json').version")"
+          # Prefer the version the release job resolved; fall back to the file.
+          version="${INPUT_VERSION:-$(node -p "require('./package.json').version")}"
           suffix="$(date -u +%Y%m%d)"
           short_sha="${GITHUB_SHA:0:12}"
           {

@@ -50,6 +50,10 @@ jobs:
       version: ${{ steps.bump.outputs.version }}
       tag: ${{ steps.bump.outputs.tag }}
       released: ${{ steps.bump.outputs.released }}
+      # The commit that actually carries the release. The publish job must build
+      # THIS, not github.sha: the bump commit is created inside this job, so
+      # github.sha is always one version behind the tag.
+      sha: ${{ steps.bump.outputs.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -101,6 +105,8 @@ jobs:
           echo "version=${next}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "released=true" >> "$GITHUB_OUTPUT"
+          # Placeholder; the push step rewrites this with the commit that lands.
+          echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
           echo "Releasing ${tag} (previous tag: ${last_tag:-none})" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build release notes
@@ -202,6 +208,9 @@ jobs:
               git tag -a "${TAG}" -F /tmp/tagmsg.txt
               if git push origin "HEAD:${GITHUB_REF_NAME}" --follow-tags; then
                 echo "Pushed ${TAG} on attempt ${attempt}."
+                # Publish the commit that actually landed so the image is built
+                # from the released tree, not the pre-bump triggering SHA.
+                echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
             else
@@ -237,6 +246,9 @@ jobs:
     uses: ./.github/workflows/fork-docker-publish.yml
     with:
       extensions: ""
+      # Build the released commit, not github.sha (which predates the bump).
+      ref: ${{ needs.version.outputs.sha }}
+      version: ${{ needs.version.outputs.version }}
     # Pass only what the reusable workflow declares — `secrets: inherit` hands
     # every parent secret to the callee and is flagged by zizmor
     # (secrets-inherit, medium) in the Workflow Sanity audit.
